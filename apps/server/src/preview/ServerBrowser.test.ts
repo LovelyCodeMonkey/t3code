@@ -64,10 +64,15 @@ function makeSession() {
   return {
     on: vi.fn(),
     detach: vi.fn(async () => {}),
-    send: vi.fn(async (method: string, _input?: unknown): Promise<Record<string, unknown>> => {
+    send: vi.fn(async (method: string, input?: unknown): Promise<Record<string, unknown>> => {
       if (method === "Page.getNavigationHistory") return { currentIndex: 0, entries: [{}] };
       if (method === "Page.getLayoutMetrics") return { cssVisualViewport: { pageX: 0, pageY: 0 } };
       if (method === "Page.captureScreenshot") return { data: "ZnJhbWU=" };
+      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "main" } } };
+      if (method === "Page.createIsolatedWorld") return { executionContextId: 7 };
+      // The clipboard world answers with what the page last copied.
+      if (method === "Runtime.evaluate" && (input as { contextId?: number }).contextId === 7)
+        return { result: { value: pageCopy } };
       return { result: { value: "evaluated" } };
     }),
   };
@@ -130,10 +135,6 @@ function makeContext(onClose?: (context: BrowserContext) => void) {
     sessions,
     newPage: async () => page as unknown as Page,
     grantPermissions: vi.fn(async () => {}),
-    exposeBinding: vi.fn(async (_name: string, binding: ClipboardBinding) => {
-      clipboardBinding = binding;
-    }),
-    addInitScript: vi.fn(async () => {}),
     newCDPSession: async () => {
       const session = makeSession();
       sessions.push(session);
@@ -153,8 +154,8 @@ const contexts: ReturnType<typeof makeContext>[] = [];
 /** The profile and isolation each headless tab asked its context for. */
 const contextRequests: Array<{ profileId: string; isolated: boolean }> = [];
 let contextGate: PromiseWithResolvers<void> | null = null;
-type ClipboardBinding = (source: { page: unknown }, text: unknown) => void;
-let clipboardBinding: ClipboardBinding | null = null;
+/** The text the page's frames hold from their latest copy. */
+let pageCopy = "";
 let contextFailure: Error | null = null;
 /** Server tabs the fake desktop renders, and the endpoints the server connected to. */
 let desktopRendersNext = false;
@@ -272,6 +273,7 @@ beforeEach(() => {
   contextRequests.length = 0;
   contextGate = null;
   contextFailure = null;
+  pageCopy = "";
   desktopTabs.clear();
   desktopRendersNext = false;
   releasedDesktopTabs.length = 0;
@@ -1007,11 +1009,10 @@ it.live("closing a tab while a viewer is still opening it does not leave its pag
   ).pipe(Effect.provide(layer)),
 );
 
-it.live("page copies reach only the controlling viewer right after its input", () =>
+it.live("only the controlling viewer's copy and cut keys reach its clipboard", () =>
   Effect.scoped(
     Effect.gen(function* () {
       const { browser, tabId } = yield* ready;
-      const page = contexts[0]!.page;
       const watcher = yield* browser.attachViewer(viewerInput(tabId, false));
       const viewer = yield* browser.attachViewer(viewerInput(tabId, true));
       yield* viewer.input({ type: "takeControl" });
@@ -1019,17 +1020,28 @@ it.live("page copies reach only the controlling viewer right after its input", (
         Queue.clear(queue).pipe(
           Effect.map((items) => items.filter((item) => item._tag === "clipboard")),
         );
-      // A page writing on its own, without a recent gesture, stays on the server.
-      clipboardBinding!({ page }, "unprompted");
+      // What the page copied on its own stays on the server through other input.
+      pageCopy = "unprompted";
+      yield* viewer.input({ type: "mouse", action: "move", x: 10, y: 10 });
+      yield* viewer.input({ type: "wheel", x: 10, y: 10, deltaY: 40 });
+      yield* viewer.input({ type: "key", action: "down", key: "v", code: "KeyV", modifiers: 4 });
+      yield* viewer.input({ type: "unknown" });
       expect(yield* clipboard(viewer.output)).toEqual([]);
+      pageCopy = "copied";
       yield* viewer.input({ type: "key", action: "down", key: "c", code: "KeyC", modifiers: 4 });
       const cdp = contexts[0]!.sessions.at(-1)!;
       expect(cdp.send).toHaveBeenCalledWith(
         "Input.dispatchKeyEvent",
         expect.objectContaining({ key: "c", commands: ["copy"] }),
       );
-      clipboardBinding!({ page }, "copied");
       expect(yield* clipboard(viewer.output)).toEqual([{ _tag: "clipboard", text: "copied" }]);
+      pageCopy = "cut";
+      yield* viewer.input({ type: "key", action: "down", key: "x", code: "KeyX", modifiers: 2 });
+      expect(yield* clipboard(viewer.output)).toEqual([{ _tag: "clipboard", text: "cut" }]);
+      // A copy key with nothing copied sends nothing.
+      pageCopy = "";
+      yield* viewer.input({ type: "key", action: "down", key: "c", code: "KeyC", modifiers: 4 });
+      expect(yield* clipboard(viewer.output)).toEqual([]);
       expect(yield* clipboard(watcher.output)).toEqual([]);
     }),
   ).pipe(Effect.provide(layer)),
