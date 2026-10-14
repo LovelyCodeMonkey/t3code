@@ -1,6 +1,8 @@
 // @effect-diagnostics globalDate:off -- UI snooze presets use local calendar boundaries and Intl labels.
 import * as DateTime from "effect/DateTime";
 
+import type { PendingSubagentRequest } from "./models.ts";
+
 interface SettlementRunLike {
   readonly turnId?: unknown;
   readonly assistantMessageId?: unknown;
@@ -90,18 +92,20 @@ export interface ThreadSnoozeShell extends QueuedThreadShell {
   readonly snoozedAt?: string | null;
   readonly hasPendingApprovals: boolean;
   readonly hasPendingUserInput: boolean;
+  readonly pendingSubagentRequest?: PendingSubagentRequest | null;
 }
 
 /**
  * A snoozed thread "raises its hand" when something happens that outranks
- * the user's snooze: the agent is blocked on them (approval / user input),
- * the session failed, or a run completed after the snooze was set — the
- * v1 taste of event-based snooze ("something happened" wakes early).
- * Raising a hand never clears the server-side snooze fields; it only stops
- * the thread from classifying as snoozed.
+ * the user's snooze: the agent or one of its subagents is blocked on them
+ * (approval / user input), the session failed, or a run completed after the
+ * snooze was set — the v1 taste of event-based snooze ("something happened"
+ * wakes early). Raising a hand never clears the server-side snooze fields; it
+ * only stops the thread from classifying as snoozed.
  */
 export function threadRaisedHandWhileSnoozed(shell: ThreadSnoozeShell): boolean {
   if (shell.hasPendingApprovals || shell.hasPendingUserInput) return true;
+  if (shell.pendingSubagentRequest != null) return true;
   const runtime = shell.runtime ?? shell.session ?? null;
   const latestRun = shell.latestRun ?? shell.latestTurn ?? null;
   // Only a FRESH failure raises the hand: a thread snoozed while already
