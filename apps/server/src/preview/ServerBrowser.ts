@@ -66,6 +66,7 @@ import type {
   Dialog,
   Download,
   FileChooser,
+  Frame,
   Page,
 } from "playwright-core";
 
@@ -288,6 +289,8 @@ interface ServerTab {
   readonly tabId: string;
   readonly page: Page;
   readonly cdp: CDPSession;
+  /** Sessions of the page's frames that run in their own process. */
+  readonly frameSessions: Map<Frame, CDPSession>;
   readonly createdAt: number;
   /** The agent's latest request on this tab; idle agent tabs close. */
   usedAt: number;
@@ -786,6 +789,7 @@ const make = Effect.gen(function* () {
       tabId: snapshot.tabId,
       page,
       cdp,
+      frameSessions: new Map(),
       createdAt: Date.now(),
       usedAt: Date.now(),
       viewers: new Set(),
@@ -834,7 +838,10 @@ const make = Effect.gen(function* () {
     page.on("framenavigated", (frame) => {
       // Same-document navigations (SPA routes) fire no load event.
       if (frame === page.mainFrame() && !tab.loading) void reportLoaded(tab);
+      if (!desktop) void recordFrameCopies(tab, frame);
     });
+    // An adopted popup's frames may have loaded before the tab listened.
+    if (adopted) for (const frame of page.frames()) void recordFrameCopies(tab, frame);
     page.on("requestfailed", (request) => {
       const errorText = request.failure()?.errorText ?? "";
       pushBounded(tab.networkEntries, {
@@ -1137,7 +1144,7 @@ const make = Effect.gen(function* () {
     await context.grantPermissions(["clipboard-write"]);
   };
 
-  /** Records the copies made in each of a headless page's frames. */
+  /** Records the copies made in each frame a session reaches. */
   const recordCopies = async (cdp: CDPSession) => {
     // Scripts for new documents run only while this session's Page domain is on.
     await cdp.send("Page.enable");
@@ -1148,19 +1155,48 @@ const make = Effect.gen(function* () {
     });
   };
 
-  /** Clears every frame's copy and returns what the key just handled copied or cut. */
-  const takeCopiedText = async (tab: ServerTab) => {
-    const { frameTree } = await tab.cdp.send("Page.getFrameTree");
-    const frameIds = (node: typeof frameTree): Array<string> => [
+  /**
+   * A frame in its own process, such as one with an `Origin-Agent-Cluster`
+   * header, is out of the page session's reach, so it records copies through
+   * its own session until that target closes.
+   */
+  const recordFrameCopies = async (tab: ServerTab, frame: Frame) => {
+    if (frame === tab.page.mainFrame() || tab.frameSessions.has(frame)) return;
+    // A frame in its parent's process has no session of its own.
+    const cdp = await tab.page
+      .context()
+      .newCDPSession(frame)
+      .catch(() => null);
+    if (!cdp) return;
+    if (tab.frameSessions.has(frame) || frame.isDetached()) {
+      await cdp.detach().catch(constVoid);
+      return;
+    }
+    tab.frameSessions.set(frame, cdp);
+    cdp.on("close", () => {
+      if (tab.frameSessions.get(frame) !== cdp) return;
+      tab.frameSessions.delete(frame);
+      // A frame that moved to another process records through its new target.
+      if (!frame.isDetached()) void recordFrameCopies(tab, frame);
+    });
+    await recordCopies(cdp).catch(constVoid);
+  };
+
+  /** Clears and returns the copy of each frame a session reaches. */
+  const takeSessionCopies = async (cdp: CDPSession) => {
+    // An out-of-process frame that closed meanwhile copied nothing.
+    const tree = await cdp.send("Page.getFrameTree").catch(() => null);
+    if (!tree) return [];
+    const frameIds = (node: typeof tree.frameTree): Array<string> => [
       node.frame.id,
       ...(node.childFrames ?? []).flatMap(frameIds),
     ];
-    const copies = await Promise.all(
-      frameIds(frameTree).map((frameId) =>
-        tab.cdp
+    return Promise.all(
+      frameIds(tree.frameTree).map((frameId) =>
+        cdp
           .send("Page.createIsolatedWorld", { frameId, worldName: CLIPBOARD_WORLD })
           .then(({ executionContextId }) =>
-            tab.cdp.send("Runtime.evaluate", {
+            cdp.send("Runtime.evaluate", {
               contextId: executionContextId,
               expression: "globalThis.takeCopy?.()",
               returnByValue: true,
@@ -1173,7 +1209,14 @@ const make = Effect.gen(function* () {
           ),
       ),
     );
-    return copies.find((text) => text.length > 0);
+  };
+
+  /** Clears every frame's copy and returns what the key just handled copied or cut. */
+  const takeCopiedText = async (tab: ServerTab) => {
+    const copies = await Promise.all(
+      [tab.cdp, ...tab.frameSessions.values()].map(takeSessionCopies),
+    );
+    return copies.flat().find((text) => text.length > 0);
   };
 
   const adoptPopup = async (opener: ServerTab, popup: Page) => {

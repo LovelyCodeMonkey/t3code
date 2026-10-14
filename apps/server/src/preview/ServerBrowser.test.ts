@@ -60,9 +60,22 @@ vi.mock("./ServerBrowserContexts.ts", () => ({
   },
 }));
 
-function makeSession() {
+/** A frame in its own process. Only its own session reaches the copy it holds. */
+function makeFrame() {
+  const frame = {
+    copy: "",
+    detached: false,
+    isDetached: () => frame.detached,
+    recording: Promise.withResolvers<void>(),
+  };
+  return frame;
+}
+
+function makeSession(frame?: ReturnType<typeof makeFrame>) {
+  const events = new NodeEvents.EventEmitter();
   return {
-    on: vi.fn(),
+    on: vi.fn((name: string, listener: () => void) => events.on(name, listener)),
+    emit: (name: string) => events.emit(name),
     detach: vi.fn(async () => {}),
     send: vi.fn(async (method: string, input?: unknown): Promise<Record<string, unknown>> => {
       if (method === "Page.getNavigationHistory") return { currentIndex: 0, entries: [{}] };
@@ -70,13 +83,18 @@ function makeSession() {
       if (method === "Page.captureScreenshot") return { data: "ZnJhbWU=" };
       if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "main" } } };
       if (method === "Page.createIsolatedWorld") return { executionContextId: 7 };
-      // A copy or cut key copies keyCopy; one that copies nothing leaves the frames as they were.
-      if (method === "Input.dispatchKeyEvent" && (input as { commands?: unknown }).commands)
-        pageCopy = keyCopy || pageCopy;
-      // The clipboard world hands over what the page's frames copied, once.
+      if (method === "Page.addScriptToEvaluateOnNewDocument") frame?.recording.resolve();
+      // A copy or cut key copies keyCopy in the focused frame, or the page's process if none;
+      // one that copies nothing leaves the frames as they were.
+      if (method === "Input.dispatchKeyEvent" && (input as { commands?: unknown }).commands) {
+        if (focusedFrame) focusedFrame.copy = keyCopy || focusedFrame.copy;
+        else pageCopy = keyCopy || pageCopy;
+      }
+      // The clipboard world hands over what the session's frames copied, once.
       if (method === "Runtime.evaluate" && (input as { contextId?: number }).contextId === 7) {
-        const value = pageCopy;
-        pageCopy = "";
+        const value = frame ? frame.copy : pageCopy;
+        if (frame) frame.copy = "";
+        else pageCopy = "";
         return { result: { value } };
       }
       return { result: { value: "evaluated" } };
@@ -102,6 +120,7 @@ function makeContext(onClose?: (context: BrowserContext) => void) {
     setDefaultNavigationTimeout: vi.fn(),
     context: () => context,
     mainFrame: () => page,
+    frames: () => [page],
     url: () => url,
     title: vi.fn(async () => "test page"),
     viewportSize: () => viewport,
@@ -141,8 +160,10 @@ function makeContext(onClose?: (context: BrowserContext) => void) {
     sessions,
     newPage: async () => page as unknown as Page,
     grantPermissions: vi.fn(async () => {}),
-    newCDPSession: async () => {
-      const session = makeSession();
+    newCDPSession: async (target: unknown) => {
+      const session = makeSession(
+        target === page ? undefined : (target as ReturnType<typeof makeFrame>),
+      );
       sessions.push(session);
       return session;
     },
@@ -164,6 +185,8 @@ let contextGate: PromiseWithResolvers<void> | null = null;
 let pageCopy = "";
 /** The text the next copy or cut key copies. */
 let keyCopy = "";
+/** The frame in its own process that has focus; otherwise keys copy in the page's process. */
+let focusedFrame: ReturnType<typeof makeFrame> | null = null;
 let contextFailure: Error | null = null;
 /** Server tabs the fake desktop renders, and the endpoints the server connected to. */
 let desktopRendersNext = false;
@@ -283,6 +306,7 @@ beforeEach(() => {
   contextFailure = null;
   pageCopy = "";
   keyCopy = "";
+  focusedFrame = null;
   desktopTabs.clear();
   desktopRendersNext = false;
   releasedDesktopTabs.length = 0;
@@ -1053,6 +1077,40 @@ it.live("only the controlling viewer's copy and cut keys reach its clipboard", (
       yield* viewer.input({ type: "key", action: "down", key: "c", code: "KeyC", modifiers: 4 });
       expect(yield* clipboard(viewer.output)).toEqual([]);
       expect(yield* clipboard(watcher.output)).toEqual([]);
+    }),
+  ).pipe(Effect.provide(layer)),
+);
+
+it.live("copy keys reach the viewer from a frame in its own process", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const { browser, tabId } = yield* ready;
+      const viewer = yield* browser.attachViewer(viewerInput(tabId, true));
+      yield* viewer.input({ type: "takeControl" });
+      const copy = () =>
+        viewer.input({ type: "key", action: "down", key: "c", code: "KeyC", modifiers: 4 }).pipe(
+          Effect.andThen(Queue.clear(viewer.output)),
+          Effect.map((items) => items.filter((item) => item._tag === "clipboard")),
+        );
+      const frame = makeFrame();
+      contexts[0]!.page.emit("framenavigated", frame);
+      yield* Effect.promise(() => frame.recording.promise);
+      const frameSession = contexts[0]!.sessions.at(-1)!;
+      focusedFrame = frame;
+      keyCopy = "framed";
+      expect(yield* copy()).toEqual([{ _tag: "clipboard", text: "framed" }]);
+      // What the frame kept from before is cleared, not sent by a key elsewhere.
+      frame.copy = "left over";
+      focusedFrame = null;
+      keyCopy = "";
+      expect(yield* copy()).toEqual([]);
+      expect(frame.copy).toBe("");
+      // A frame that went away is no longer read.
+      frame.detached = true;
+      frame.copy = "gone";
+      frameSession.emit("close");
+      expect(yield* copy()).toEqual([]);
+      expect(frame.copy).toBe("gone");
     }),
   ).pipe(Effect.provide(layer)),
 );
