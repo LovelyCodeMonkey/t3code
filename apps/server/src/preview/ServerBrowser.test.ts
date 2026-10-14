@@ -70,9 +70,15 @@ function makeSession() {
       if (method === "Page.captureScreenshot") return { data: "ZnJhbWU=" };
       if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "main" } } };
       if (method === "Page.createIsolatedWorld") return { executionContextId: 7 };
-      // The clipboard world answers with what the page last copied.
-      if (method === "Runtime.evaluate" && (input as { contextId?: number }).contextId === 7)
-        return { result: { value: pageCopy } };
+      // A copy or cut key copies keyCopy; one that copies nothing leaves the frames as they were.
+      if (method === "Input.dispatchKeyEvent" && (input as { commands?: unknown }).commands)
+        pageCopy = keyCopy || pageCopy;
+      // The clipboard world hands over what the page's frames copied, once.
+      if (method === "Runtime.evaluate" && (input as { contextId?: number }).contextId === 7) {
+        const value = pageCopy;
+        pageCopy = "";
+        return { result: { value } };
+      }
       return { result: { value: "evaluated" } };
     }),
   };
@@ -156,6 +162,8 @@ const contextRequests: Array<{ profileId: string; isolated: boolean }> = [];
 let contextGate: PromiseWithResolvers<void> | null = null;
 /** The text the page's frames hold from their latest copy. */
 let pageCopy = "";
+/** The text the next copy or cut key copies. */
+let keyCopy = "";
 let contextFailure: Error | null = null;
 /** Server tabs the fake desktop renders, and the endpoints the server connected to. */
 let desktopRendersNext = false;
@@ -274,6 +282,7 @@ beforeEach(() => {
   contextGate = null;
   contextFailure = null;
   pageCopy = "";
+  keyCopy = "";
   desktopTabs.clear();
   desktopRendersNext = false;
   releasedDesktopTabs.length = 0;
@@ -1027,7 +1036,7 @@ it.live("only the controlling viewer's copy and cut keys reach its clipboard", (
       yield* viewer.input({ type: "key", action: "down", key: "v", code: "KeyV", modifiers: 4 });
       yield* viewer.input({ type: "unknown" });
       expect(yield* clipboard(viewer.output)).toEqual([]);
-      pageCopy = "copied";
+      keyCopy = "copied";
       yield* viewer.input({ type: "key", action: "down", key: "c", code: "KeyC", modifiers: 4 });
       const cdp = contexts[0]!.sessions.at(-1)!;
       expect(cdp.send).toHaveBeenCalledWith(
@@ -1035,11 +1044,12 @@ it.live("only the controlling viewer's copy and cut keys reach its clipboard", (
         expect.objectContaining({ key: "c", commands: ["copy"] }),
       );
       expect(yield* clipboard(viewer.output)).toEqual([{ _tag: "clipboard", text: "copied" }]);
-      pageCopy = "cut";
+      keyCopy = "cut";
       yield* viewer.input({ type: "key", action: "down", key: "x", code: "KeyX", modifiers: 2 });
       expect(yield* clipboard(viewer.output)).toEqual([{ _tag: "clipboard", text: "cut" }]);
-      // A copy key with nothing copied sends nothing.
-      pageCopy = "";
+      // A copy key with nothing copied sends nothing, not what a frame kept from before.
+      pageCopy = "left over";
+      keyCopy = "";
       yield* viewer.input({ type: "key", action: "down", key: "c", code: "KeyC", modifiers: 4 });
       expect(yield* clipboard(viewer.output)).toEqual([]);
       expect(yield* clipboard(watcher.output)).toEqual([]);

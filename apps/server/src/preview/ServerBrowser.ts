@@ -440,26 +440,38 @@ const CLIPBOARD_WORLD = "t3-preview-clipboard";
 const CLIPBOARD_SCRIPT = `(() => {
   let keying = false;
   let copied = "";
+  // The same Ctrl or Cmd + C or X that editingCommand sends as copy or cut.
   addEventListener("keydown", (event) => {
-    if (!event.isTrusted) return;
+    if (!event.isTrusted || event.altKey || event.ctrlKey === event.metaKey) return;
+    const key = event.key.toLowerCase();
+    if (key !== "c" && key !== "x") return;
     keying = true;
     copied = "";
     setTimeout(() => { keying = false; });
   }, true);
   const selection = () => {
-    const field = document.activeElement;
+    let field = document.activeElement;
+    while (field?.shadowRoot?.activeElement) field = field.shadowRoot.activeElement;
     if ((field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement) && field.selectionStart !== null)
       return field.value.slice(field.selectionStart, field.selectionEnd ?? field.selectionStart);
     return String(document.getSelection() ?? "");
   };
-  // Bubbling to window runs after page handlers, before cut removes the selection.
-  const record = (event) => {
-    if (!keying || !event.isTrusted) return;
-    const text = event.defaultPrevented ? event.clipboardData?.getData("text/plain") : selection();
+  const record = (text) => {
     copied = String(text ?? "").slice(0, ${CLIPBOARD_TEXT_LIMIT});
   };
-  addEventListener("copy", record);
-  addEventListener("cut", record);
+  // Capturing at window runs before page handlers can stop the event, and
+  // before cut removes the selection.
+  const snapshot = (event) => {
+    if (keying && event.isTrusted) record(selection());
+  };
+  // Bubbling back to window picks up text a page handler set instead.
+  const replace = (event) => {
+    if (keying && event.isTrusted && event.defaultPrevented) record(event.clipboardData?.getData("text/plain"));
+  };
+  for (const type of ["copy", "cut"]) {
+    addEventListener(type, snapshot, true);
+    addEventListener(type, replace);
+  }
   globalThis.takeCopy = () => {
     const text = copied;
     copied = "";
@@ -1136,7 +1148,7 @@ const make = Effect.gen(function* () {
     });
   };
 
-  /** What the key just handled copied or cut in any of the tab's frames, once. */
+  /** Clears every frame's copy and returns what the key just handled copied or cut. */
   const takeCopiedText = async (tab: ServerTab) => {
     const { frameTree } = await tab.cdp.send("Page.getFrameTree");
     const frameIds = (node: typeof frameTree): Array<string> => [
@@ -2127,6 +2139,11 @@ const make = Effect.gen(function* () {
           return;
         }
         const command = editingCommand(key, modifiers);
+        // Only the controlling viewer's own copy and cut reach its clipboard.
+        const copying =
+          !tab.desktop && (command?.commands[0] === "copy" || command?.commands[0] === "cut");
+        // Clear what any frame kept from an earlier key, so only this key's copy is read.
+        if (copying) await takeCopiedText(tab);
         await session.send("Input.dispatchKeyEvent", {
           type: text ? "keyDown" : "rawKeyDown",
           key,
@@ -2140,9 +2157,7 @@ const make = Effect.gen(function* () {
           ),
         });
         viewer.pressedKeys.set(code || key, { key, code });
-        // Only the controlling viewer's own copy and cut reach its clipboard.
-        const copying = command?.commands[0] === "copy" || command?.commands[0] === "cut";
-        if (copying && !tab.desktop) {
+        if (copying) {
           const copied = await takeCopiedText(tab);
           if (copied) viewer.push({ _tag: "clipboard", text: copied });
         }
